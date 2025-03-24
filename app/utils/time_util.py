@@ -2,7 +2,7 @@
 from datetime import datetime, timedelta
 import time
 import pytz
-
+from functools import wraps
 
 class DateUtils:
     Shanghai_tz = pytz.timezone('Asia/Shanghai')
@@ -14,7 +14,8 @@ class DateUtils:
         Returns:
             str: 当前日期时间
         """
-        return datetime.now(DateUtils.Shanghai_tz).strftime('%Y-%m-%d %H:%M:%S')
+        return datetime.now(DateUtils.Shanghai_tz)
+        # return datetime.now(DateUtils.Shanghai_tz).strftime('%Y-%m-%d %H:%M:%S')
 
     @staticmethod
     def preday_time() -> str:
@@ -50,6 +51,7 @@ class DateUtils:
     @staticmethod
     def record_time(func):
         """记录函数执行时间"""
+        @wraps(func)
         def decorate(*args, **kwargs):
             start = time.perf_counter()
             result = func(*args, **kwargs)
