@@ -16,7 +16,7 @@ class Fake:
         db.create_all()
         i = 0
         while i < count:
-            u = User(email=fake.email(), username=fake.user_name(), password='123', name=fake.name(),
+            u = User(email=fake.email(), username=fake.user_name(), password='123', nickname=fake.name(),
                      location=fake.city(),
                      about_me='about me 个性说说')
             db.session.add(u)
@@ -43,7 +43,7 @@ class Fake:
         fake = Faker(Fake.locales)
         try:
             # 添加到User表
-            u = User(email=current_app.config['FLASKY_ADMIN'], username='zmc', password='zmc', name='追梦少年',
+            u = User(email=current_app.config['FLASKY_ADMIN'], username='zmc', password='zmc', nickname='追梦少年',
                      location='上海',
                      about_me='随便说点啥...')
             db.session.add(u)
