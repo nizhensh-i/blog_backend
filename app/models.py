@@ -75,7 +75,10 @@ class Role(db.Model):
 
 class Follow(db.Model):
     __tablename__ = 'follows'
+    # 同时设置follower_id，followed_id为主键，保证同一对用户只能存在一条关系
+    # 关注者id
     follower_id = db.Column(db.Integer, db.ForeignKey('users.id'), primary_key=True)
+    # 被关注者id
     followed_id = db.Column(db.Integer, db.ForeignKey('users.id'), primary_key=True)
     timestamp = db.Column(db.DateTime, default=DateUtils.now_time)
 
@@ -84,6 +87,7 @@ class NotificationType(Enum):
     COMMENT = '评论'
     REPLY = "回复"
     LIKE = '点赞'
+    CHAT = '私信'
 
 
 class Notification(db.Model):
@@ -109,14 +113,14 @@ class Notification(db.Model):
             'id': self.id,
             'type': self.type.value,
             'image': self.trigger_user.image,
-            'time': DateUtils.datetime_to_str(self.created_at),
+            'time': self.created_at if isinstance(self.created_at, str) else DateUtils.datetime_to_str(self.created_at),
             'triggerNickName': self.trigger_user.name,
             'triggerUsername': self.trigger_user.username,
+            'triggerId':self.trigger_user_id,
             'content': '',
             'postId': self.post_id,
             'commentId': self.comment_id,
             'isRead': self.is_read,
-
         }
         return data
 
@@ -143,10 +147,11 @@ class User(db.Model):
 
     praises = db.relationship('Praise', backref='author', lazy='dynamic')
 
-    # 关注
+    # 关注者
     followed = db.relationship('Follow', foreign_keys=[Follow.follower_id],
                                backref=db.backref('follower', lazy='joined'), lazy='dynamic',
                                cascade='all, delete-orphan')
+    # 被关注者
     followers = db.relationship('Follow', foreign_keys=[Follow.followed_id],
                                 backref=db.backref('followed', lazy='joined'), lazy='dynamic',
                                 cascade='all, delete-orphan')
@@ -157,6 +162,12 @@ class User(db.Model):
 
     triggered_notification = db.relationship('Notification', foreign_keys=[Notification.trigger_user_id],
                                              backref='trigger_user', lazy='dynamic')
+
+    sent_messages = db.relationship('Message', foreign_keys='Message.sender_id',
+                                    backref=db.backref('sender', lazy='joined'), lazy='dynamic')
+
+    received_messages = db.relationship('Message', foreign_keys='Message.receiver_id',
+                                        backref=db.backref('receiver', lazy='joined'), lazy='dynamic')
 
     @property
     def followed_posts(self):
@@ -247,8 +258,8 @@ class User(db.Model):
     def get_value(key):
         # 获取键值
         value = redis.get(key)
-        if value:
-            return value.decode()
+        # if value:
+        #     return value.decode()
         return value
 
     def follow(self, user):
@@ -281,16 +292,23 @@ class User(db.Model):
                 db.session.add(user)
                 db.session.commit()
 
+    def send_msg(self, user, content):
+        m = Message(sender=self, receiver=user, content=content)
+        db.session.add(m)
+
     def to_json(self, user):
+        post_praises = Praise.query.join(Post).filter(Post.author_id == self.id).count()
+        comment_praises = Praise.query.join(Comment).filter(Comment.author_id == self.id).count()
+        total_praises = post_praises + comment_praises
         json_user = {
             'url': url_for('api.get_user', id=self.id),
             'id': self.id,
             'username': self.username,
-            'name': self.name,
+            'nickname': self.name,
             'location': self.location,
             'about_me': self.about_me,
-            'member_since': DateUtils.datetime_to_str(self.member_since),
-            'last_seen': DateUtils.datetime_to_str(self.last_seen),
+            'member_since': self.member_since if isinstance(self.member_since, str) else DateUtils.datetime_to_str(self.member_since),
+            'last_seen': self.last_seen if isinstance(self.last_seen, str) else DateUtils.datetime_to_str(self.last_seen),
             'image': self.image,
             'admin': self.is_administrator(),
 
@@ -302,8 +320,12 @@ class User(db.Model):
             'followed_posts_url': url_for('api.get_user_followed_posts',
                                           id=self.id),
             'post_count': self.posts.count(),
+            # 粉丝
             'followers_count': self.followers.count() - 1,
+            # 关注
             'followed_count': self.followed.count() - 1,
+            # 获赞数量(文章+评论获赞)
+            'praised_count': total_praises,
             # 是否被当前用户关注
             'is_followed_by_current_user': self.is_followed_by(current_user) if current_user else self.is_followed_by(
                 user),
@@ -353,7 +375,7 @@ class Post(db.Model):
             'id': self.id,
             'body': self.body,
             'body_html': self.body_html,
-            'timestamp': DateUtils.datetime_to_str(self.timestamp),
+            'timestamp':self.timestamp if isinstance(self.timestamp, str) else DateUtils.datetime_to_str(self.timestamp),
             'author': self.author.username,
             'nick_name': self.author.name,
             'comment_count': self.comments.count(),
@@ -375,19 +397,28 @@ class Comment(db.Model):
     __tablename__ = 'comments'
     id = db.Column(db.Integer, primary_key=True)
     body = db.Column(db.Text)
-    body_html = db.Column(db.Text)
     timestamp = db.Column(db.DateTime, index=True, default=DateUtils.now_time)
-    disabled = db.Column(db.Boolean)
+    disabled = db.Column(db.Boolean, default=False)
     author_id = db.Column(db.Integer, db.ForeignKey('users.id'))
     post_id = db.Column(db.Integer, db.ForeignKey('posts.id'))
 
-    # 子评论
-    parent_comment_id = db.Column(db.Integer, db.ForeignKey('comments.id'))
-    # remote_side设置为多对一
-    parent_comment = db.relationship('Comment', back_populates='sub_comment', remote_side=[id])
-    # 默认一对多
-    sub_comment = db.relationship('Comment', back_populates='parent_comment', cascade='all, delete-orphan')
+    # 根评论id
+    root_comment_id = db.Column(db.Integer, db.ForeignKey('comments.id'))
+    # 直接父评论id
+    direct_parent_id = db.Column(db.Integer, db.ForeignKey('comments.id'))
+    # 根评论
+    root_comment = db.relationship('Comment', remote_side=[id], foreign_keys=[root_comment_id])
+
+    # 直接父评论
+    direct_parent = db.relationship('Comment', remote_side=[id], foreign_keys=[direct_parent_id],
+                                    back_populates='direct_children')
+    direct_children = db.relationship('Comment', back_populates='direct_parent', foreign_keys=[direct_parent_id],
+                                      cascade='all, delete-orphan')
+
+    # 通知
     notifications = db.relationship('Notification', backref='comments', lazy='dynamic')
+    # 评论点赞
+    praise = db.relationship('Praise', backref='comment', lazy='dynamic')
 
     def to_json(self):
         json_comment = {
@@ -396,10 +427,9 @@ class Comment(db.Model):
             'nick_name': self.author.name,
             'image': self.author.image,
             'body': self.body,
-            'body_html': self.body_html,
             'disabled': self.disabled,
-            'timestamp': DateUtils.datetime_to_str(self.timestamp),
-            'parent_comment_id': self.parent_comment_id
+            'timestamp': self.timestamp if isinstance(self.timestamp, str) else DateUtils.datetime_to_str(self.timestamp),
+            'parent_comment_id': self.root_comment_id
             # 'url': url_for('api.get_comment', id=self.id),
             # 'post_url': url_for('api.get_post', id=self.post_id),
             # 'author_url': url_for('api.get_user', id=self.author_id),
@@ -413,12 +443,31 @@ class Comment(db.Model):
             raise ValidationError('comment does not have a body')
         return Comment(body=body)
 
+    def to_json_new(self):
+        j = {
+            'id': self.id,
+            'parentId': self.root_comment_id,
+            'directParentId': self.direct_parent_id,
+            'uid': self.author.id,
+            'content': self.body if not self.disabled else '<p><i>此评论已被版主禁用</i></p>',
+            'likes': self.praise.count(),
+            'createTime': DateUtils.datetime_to_str(self.timestamp),
+            'user': {
+                'username': self.author.name if self.author.name else self.author.username,
+                'avatar': self.author.image,
+                # 'address': self.author.location,
+                'homeLink': f'/user/{self.author.username}',
+            }
+        }
+        return j
+
 
 class Praise(db.Model):
     __tablename__ = 'praise'
     id = db.Column(db.Integer, primary_key=True)
     author_id = db.Column(db.Integer, db.ForeignKey('users.id'))
     post_id = db.Column(db.Integer, db.ForeignKey('posts.id'))
+    comment_id = db.Column(db.Integer, db.ForeignKey('comments.id'))
 
     @staticmethod
     def has_praised(post_id):
@@ -459,6 +508,38 @@ class Log(db.Model):
             'os': self.os,
             'device': self.device,
             'operate': self.operate,
-            'operateTime': self.operate_time,
+            'operateTime': self.operate_time if isinstance(self.operate_time, str) else DateUtils.datetime_to_str(self.operate_time),
         }
         return json_log
+
+
+class Message(db.Model):
+    __tablename__ = 'messages'
+    id = db.Column(db.Integer, primary_key=True)
+    sender_id = db.Column(db.Integer, db.ForeignKey('users.id'))
+    receiver_id = db.Column(db.Integer, db.ForeignKey('users.id'))
+    content = db.Column(db.Text)
+    timestamp = db.Column(db.DateTime, default=DateUtils.now_time)
+    is_read = db.Column(db.Boolean, default=False)
+
+    def to_json(self):
+        # j = {
+        #     'id': self.id,
+        #     'sender_id': self.sender_id,
+        #     'content': self.content,
+        #     'timestamp': DateUtils.datetime_to_str(self.timestamp),
+        #     'is_read': self.is_read
+        # }
+        j = {
+            'content': self.content,
+            'uid': self.sender_id,
+            'user': {
+                'username': self.sender.name if self.sender.name else self.sender.username,
+                'avatar': self.sender.image,
+            },
+            'createTime': self.timestamp if isinstance(self.timestamp, str) else DateUtils.datetime_to_str(self.timestamp),
+
+            'sender_id': self.sender_id,
+            'is_read': self.is_read,
+        }
+        return j

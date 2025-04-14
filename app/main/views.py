@@ -1,6 +1,6 @@
-from flask_jwt_extended import jwt_required, current_user, get_jwt_identity, decode_token
+from flask_jwt_extended import jwt_required, current_user, get_jwt_identity, decode_token, verify_jwt_in_request
 from . import main
-from ..models import User, Role, Post, Permission, Comment, Follow, Praise, Log, Notification, NotificationType
+from ..models import User, Role, Post, Permission, Comment, Follow, Praise, Log, Notification, NotificationType, Message
 from ..decorators import permission_required, admin_required, log_operate
 from .. import db
 from flask import jsonify, current_app, request, abort, url_for, redirect
@@ -9,6 +9,7 @@ from ..utils.socket_util import ManageSocket
 from flask_sqlalchemy import record_queries
 from ..fake import Fake
 from .. import socketio
+from ..event import *
 from flask_socketio import disconnect
 from flask_socketio import join_room, ConnectionRefusedError
 
@@ -29,6 +30,7 @@ def after_request(response):
 
 # --------------------------- 编辑资料 ---------------------------
 @main.route('/edit-profile', methods=['POST'])
+@jwt_required()
 def edit_peofile():
     user_info = request.get_json()
     current_user.name = user_info.get('name')
@@ -109,6 +111,7 @@ def user(username):
 @main.route('/edit/<int:id>', methods=['GET', 'PUT'])
 @jwt_required()
 def edit(id):
+    # PUT 文章已使用api中的
     """编辑博客文章"""
     post = Post.query.get_or_404(id)
     if current_user.username != post.author.username and not current_user.can(Permission.ADMIN):
@@ -167,6 +170,8 @@ def followers(username):
         if item.follower.username != username:
             is_following_back = Follow.query.filter_by(follower=user, followed=item.follower).first() is not None
             follows.append({
+                'id': item.follower.id,
+                'nickname': item.follower.name,
                 'username': item.follower.username,
                 'image': item.follower.image,
                 'timestamp': DateUtils.datetime_to_str(item.timestamp),
@@ -190,6 +195,8 @@ def followed_by(username):
         if item.followed.username != username:
             is_following_back = Follow.query.filter_by(follower=item.followed, followed=user).first() is not None
             follows.append({
+                'id': item.followed.id,
+                'nickname': item.followed.name,
                 'username': item.followed.username,
                 'image': item.followed.image,
                 'timestamp': DateUtils.datetime_to_str(item.timestamp),
@@ -210,76 +217,94 @@ def can(perm):
 # get 评论已使用api中的
 @main.route('/post/<int:id>', methods=['GET', 'POST'])
 def post(id):
-    """为文章提供固定链接、博客评论"""
+    """发布和获取博客评论（适配direct_parent关系）"""
     post = Post.query.get_or_404(id)
     if request.method == 'POST':
-        jwt_required()  # POST 请求需要 JWT 验证
+        verify_jwt_in_request()
         data = request.get_json()
+        # 直接父id
+        direct_parent_id = data.get('directParentId')
         try:
-            # 创建评论对象
-            parent_comment = Comment.query.get(data.get('parentCommentId')) if 'parentCommentId' in data else None
+            direct_parent = None
+            root_comment = None
+
+            # 若是根评论，  则direct_parent=root_commentNone = None
+            # 若是一级回复，则direct_parent=root_commentNone = 根评论对象
+            # 若是其他回复，则direct_parent = 直接评论对象， root_commentNone = 根评论对象
+            if direct_parent_id:
+                # 直接父id
+                direct_parent = Comment.query.get(direct_parent_id)
+                # 获取根评论：如果父评论本身有根评论则继承，否则父评论就是根评论
+                root_comment = direct_parent.root_comment if direct_parent.root_comment_id else direct_parent
+
+            print('direct_parent', direct_parent)
+            print('root_comment', root_comment)
+            # 创建评论（设置两个父级关系）
             comment = Comment(
                 body=data.get('body'),
                 post=post,
                 author=current_user,
-                parent_comment=parent_comment
+                direct_parent=direct_parent,
+                root_comment=root_comment
             )
             db.session.add(comment)
             db.session.flush()
-
-            # 生成通知列表
-            notifications = []
-            # 作者评论自己文章时不会收到通知
-            if current_user.id != post.author_id:
-                # 用户回复作者时，作者只能受到回复通知，而不会收到评论通知
-                if not parent_comment or (parent_comment and parent_comment.author_id != post.author_id):
-                    notifications.append(Notification(
-                        receiver_id=post.author_id,
-                        trigger_user_id=current_user.id,
-                        post_id=post.id,
-                        comment_id=comment.id,
-                        type=NotificationType.COMMENT
-                    ))
-
-            # 添加回复通知
-            # 用户回复自己的评论时不产生通知
-            if parent_comment and parent_comment.author_id != current_user.id:
-                notifications.append(
-                    Notification(
-                        receiver_id=parent_comment.author_id,
-                        trigger_user_id=current_user.id,
-                        post_id=post.id,
-                        comment_id=comment.id,
-                        type=NotificationType.REPLY
-                    )
-                )
-
-            # 批量提交数据库操作
+            # 通知
+            notifications = notice_by_comment_type(direct_parent, root_comment, post, comment)
             db.session.add_all(notifications)
             db.session.commit()
+            # 实时推送
+            for notification in notifications:
+                socketio.emit(
+                    'new_notification',
+                    notification.to_json(),
+                    to=str(notification.receiver_id)
+                )
+
+            return redirect(url_for('.post', id=post.id, page=-1))
+
         except Exception as e:
             db.session.rollback()
             return jsonify(data='', total=0, currentPage=1, msg='fail', detail=str(e)), 500
 
-        # 实时推送通知
-        for notification in notifications:
-            socketio.emit(
-                'new_notification',
-                notification.to_json(),
-                to=str(notification.receiver_id)
-            )
-
-        return redirect(url_for('.post', id=post.id, page=-1))
+    # GET请求处理（保持原分页逻辑）
     page = request.args.get('page', 1, type=int)
     if page == -1:
         page = (post.comments.count() - 1) // current_app.config['FLASKY_COMMENTS_PER_PAGE'] + 1
     pagination = post.comments.order_by(Comment.timestamp.asc()).paginate(
         page=page, per_page=current_app.config['FLASKY_COMMENTS_PER_PAGE'],
         error_out=False)
-    comments = [
-        {'body': item.body, 'timestamp': DateUtils.datetime_to_str(item.timestamp), 'author': item.author.username,
-         'nick_name': item.author.name, 'disabled': item.disabled} for item in pagination.items]
-    return jsonify(data=comments, total=post.comments.count(), currentPage=page, msg='success')
+    return jsonify(data=[comment.to_json_new() for comment in pagination.items], total=post.comments.count(),
+                   currentPage=page, msg='success')
+
+
+def notice_by_comment_type(direct_parent, root_comment, post, comment):
+    """
+        根评论: 通知文章作者
+        一级回复或其他回复: 不通知文章作者，仅通知被直接回复的用户
+    """
+    notifications = []
+    # 根评论
+    if not direct_parent and not root_comment:
+        if current_user.id != post.author_id:
+            notifications.append(Notification(
+                receiver_id=post.author_id,
+                trigger_user_id=current_user.id,
+                post_id=post.id,
+                comment_id=comment.id,
+                type=NotificationType.COMMENT  # 文章评论通知
+            ))
+    # 一级回复或其他回复
+    else:
+        if current_user.id != direct_parent.author_id:
+            notifications.append(Notification(
+                receiver_id=direct_parent.author_id,
+                trigger_user_id=current_user.id,
+                post_id=post.id,
+                comment_id=comment.id,
+                type=NotificationType.REPLY  # 回复通知
+            ))
+    return notifications
 
 
 @main.route('/moderate')
@@ -348,11 +373,12 @@ def add_user_and_post():
 
 
 @main.route('/praise/<int:id>', methods=['GET', 'POST'])
-@jwt_required()
 def praise(id):
     """文章点赞"""
     post = Post.query.get_or_404(id)
     if request.method == 'POST':
+        # POST 请求需要 JWT 验证
+        verify_jwt_in_request()
         praise = Praise(post=post, author=current_user)
         db.session.add(praise)
         try:
@@ -361,7 +387,7 @@ def praise(id):
                 db.session.flush()
                 notification = Notification(receiver_id=post.author_id, trigger_user_id=praise.author_id,
                                             post_id=post.id,
-                                            comment_id=praise.id, type=NotificationType.LIKE)
+                                            comment_id=None, type=NotificationType.LIKE)
                 db.session.add(notification)
             db.session.commit()
         except Exception as e:
@@ -371,6 +397,44 @@ def praise(id):
             socketio.emit('new_notification', notification.to_json(), to=str(post.author_id))  # 发送到作者的房间
         return jsonify(praise_total=post.praise.count(), has_praised=True, msg='success', detail='')
     return jsonify(praise_toal=post.praise.count(), msg='success', detail='')
+
+
+@main.route('/praise/comment/<int:id>', methods=['GET', 'POST'])
+def praise_comment(id):
+    """文章点赞"""
+    comment = Comment.query.get_or_404(id)
+    if request.method == 'POST':
+        # POST 请求需要 JWT 验证
+        verify_jwt_in_request()
+        praise = Praise(comment=comment, author=current_user)
+        db.session.add(praise)
+        try:
+            # 将挂起的更改发送到数据库，但不会提交事务
+            if current_user.id != comment.author_id:
+                db.session.flush()
+                notification = Notification(receiver_id=comment.author_id, trigger_user_id=praise.author_id,
+                                            post_id=comment.post_id,
+                                            comment_id=comment.id, type=NotificationType.LIKE)
+                db.session.add(notification)
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            return jsonify(praise_total=0, msg='fail', detail=f'点赞操作失败，已回滚.{str(e)}'), 500
+        if current_user.id != comment.author_id:
+            socketio.emit('new_notification', notification.to_json(), to=str(comment.author_id))  # 发送到作者的房间
+        return jsonify(praise_total=comment.praise.count(), msg='success', detail='')
+    return jsonify(praise_toal=comment.praise.count(), msg='success', detail='')
+
+
+@main.route('/has_praised/<int:post_id>')
+def has_praised_comment_id(post_id):
+    """查找某文章下当前用户已点赞的评论id"""
+    comment_ids = db.session.query(Praise.comment_id).join(Comment).filter(
+        Praise.author_id == current_user.id,
+        Comment.post_id == post_id,
+        Praise.comment_id.isnot(None)
+    ).distinct().all()
+    return jsonify(data=[item[0] for item in comment_ids], msg='success')
 
 
 @main.route('/logs', methods=['GET'])
@@ -418,49 +482,6 @@ def create_comment():
     return jsonify({"message": "Comment created"}), 200
 
 
-# 处理WebSocket连接
-@socketio.on('connect')
-@jwt_required(optional=True)
-def handle_connect(auth):
-    try:
-        # 从Socket.IO连接中获取JWT（通常通过查询参数或头传递）
-        token = request.args.get('token')
-        if not token:
-            raise ConnectionRefusedError('Unauthorized')
-        raw_token = token.replace("Bearer ", "", 1)
-        # 手动解码 Token
-        decoded_token = decode_token(raw_token)
-        current_user_id = decoded_token["sub"]
-
-        # 检查用户是否存在
-        if not User.query.get(current_user_id):
-            raise ConnectionRefusedError("用户不存在")
-
-        # 断开旧连接
-        old_sids = manage_socket.user_socket.get(current_user_id, set())
-        for sid in old_sids:
-            print('断开旧连接：', sid)
-            disconnect(sid)
-        # 记录连接
-        # 读取不了current_user.username。因为这不是http请求，无法应用jwt_required，所以读取不了current_user对象的属性
-        manage_socket.add_user_socket(current_user_id, request.sid)
-        # 将用户加入以自身ID命名的房间
-        join_room(str(current_user_id))
-        u = User.query.get(current_user_id)
-        print(f"用户 {u.username} connected to room。新连接：{request.sid}")
-
-    except Exception as e:
-        print(f"WebSocket connection failed: {str(e)}")
-        raise ConnectionRefusedError('Authentication failed')
-
-
-# 处理WebSocket连接
-@socketio.on('disconnect')
-def handle_disconnect(reason):
-    manage_socket.remove_user_socket(request.sid)
-    print(f'用户断开了', request.sid)
-
-
 @main.route('/notification/unread')
 @jwt_required()
 def get_unread_notification():
@@ -491,3 +512,51 @@ def online():
     print(users)
     online_total = len(users)
     return jsonify(data=users, msg='success', total=online_total)
+
+
+# @main.route('/msg', methods=['POST'])
+# @jwt_required()
+# def send_msg():
+#     j = request.get_json()
+#     user_id = j.get('userId')
+#     content = j.get('content')
+#     u = User.query.filter_by(id=user_id).first()
+#     current_user.send_msg(u, content)
+#     db.session.commit()
+#     return jsonify(data='', msg='success', detail='')
+
+
+@main.route('/msg', methods=['GET'])
+@jwt_required()
+def get_message_history():
+    current_user_id = current_user.id
+    other_user_id = request.args.get('userId')
+    page = request.args.get('page', 1, type=int)
+    print('page:', page)
+    query = Message.query.filter(
+        ((Message.sender_id == current_user_id) & (Message.receiver_id == other_user_id)) |
+        ((Message.sender_id == other_user_id) & (Message.receiver_id == current_user_id))
+    ).order_by(Message.timestamp.desc())
+    pagination = query.paginate(
+        page=page, per_page=current_app.config['FLASKY_CHAT_PER_PAGE'], error_out=False)
+    messages = pagination.items
+    r = []
+    _id = len(messages)
+    for message in messages:
+        r1 = message.to_json()
+        r1.update({'id': _id})
+        r.append(r1)
+        _id -= 1
+    return jsonify(data=r, msg='success', total=pagination.total, detail='')
+
+
+@main.route('/msg/read', methods=['POST'])
+@jwt_required()
+def mark_messages_read():
+    message_ids = request.json.get('ids', [])
+    Message.query.filter(
+        Message.id.in_(message_ids),
+        Message.receiver_id == current_user.id()
+    ).update({'is_read': True}, synchronize_session=False)
+    db.session.commit()
+    return jsonify(data='', msg='success', detail='')
