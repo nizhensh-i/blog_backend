@@ -143,13 +143,13 @@ def new_post_notification(post_id):
     db.session.commit()
 
 
-def get_user_posts(username, page=1):
-    """获取用户文章的公共逻辑"""
+def get_user_data(username):
+    """获取用户数据的公共逻辑"""
     user = User.query.filter_by(username=username).first()
     # 如果登录的用户时管理员，则会携带 电子邮件地址
     if current_user and current_user.is_administrator():
-        return user.to_json(user)
-    j = user.to_json(user)
+        return user.to_json()
+    j = user.to_json()
     j.pop('email', None)
     j.pop('confirmed', None)
     return j
@@ -174,7 +174,7 @@ def user(username):
 @jwt_required(optional=True)
 def get_user_by_username(username):
     """根据用户名获取用户数据"""
-    data = get_user_posts(username)
+    data = get_user_data(username)
     return jsonify(data=data, msg='success')
 
 
@@ -208,7 +208,7 @@ def follow(username):
         return jsonify(data='fail', msg="你已经关注了该用户")
     current_user.follow(user)
     db.session.commit()
-    data = get_user_posts(username)
+    data = get_user_data(username)
     return jsonify(data=data, msg='success')
 
 
@@ -223,7 +223,7 @@ def unfollow(username):
         return jsonify(data='fail', msg="你未关注该用户")
     current_user.unfollow(user)
     db.session.commit()
-    data = get_user_posts(username)
+    data = get_user_data(username)
     return jsonify(data=data, msg='success')
 
 
@@ -712,7 +712,6 @@ def del_qiniu_image(keys, bucket_name=os.getenv('QINIU_BUCKET_NAME')):
 
 
 @main.route('/dir_name')
-@jwt_required()
 def query_qiniu_key():
     """查询七牛云某个bucket指定目录的所有文件名"""
     # 前缀
@@ -813,6 +812,7 @@ def get_all_tags():
 @main.route('/update_user_tag', methods=['POST'])
 @jwt_required()
 def edit_user_tag():
+    """更新当前用户标签"""
     d = request.get_json()
     tag_add = set(d.get('tagAdd', []))
     tag_remove = set(d.get('tagRemove', []))
@@ -831,3 +831,26 @@ def edit_user_tag():
             current_user.tags.remove(tag)
     db.session.commit()
     return jsonify(data='', msg='success', detail='')
+
+
+@main.route("/update_tag", methods=["POST"])
+def update_tag():
+    """更新公共标签库"""
+    d = request.json
+    tag_add = set(d.get('tagAdd', []))
+    tag_remove = set(d.get('tagRemove', []))
+
+    # 添加新的标签
+    t = [Tag(name=tag) for tag in tag_add if tag]
+    if t:
+        db.session.add_all(t)
+
+    # 删除Tag表
+    if tag_remove:
+        tags_to_delete = Tag.query.filter(Tag.name.in_(tag_remove)).all()
+        # 逐个删除，触发before_delete事件
+        for tag in tags_to_delete:
+            db.session.delete(tag)
+
+    db.session.commit()
+    return jsonify(data="", msg="success", detail="")

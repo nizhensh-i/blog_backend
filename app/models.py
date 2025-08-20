@@ -11,7 +11,7 @@ import random
 from . import redis
 from .exceptions import ValidationError
 from enum import Enum
-from sqlalchemy import and_
+from sqlalchemy import and_, event
 
 
 class Permission:
@@ -315,7 +315,7 @@ class User(db.Model):
         m = Message(sender=self, receiver=user, content=content)
         db.session.add(m)
 
-    def to_json(self, user):
+    def to_json(self):
         post_praises = Praise.query.join(Post).filter(Post.author_id == self.id).count()
         comment_praises = Praise.query.join(Comment).filter(Comment.author_id == self.id).count()
         total_praises = post_praises + comment_praises
@@ -330,7 +330,8 @@ class User(db.Model):
                 elif image.type == ImageType.BOOK:
                     interest['books'].append(image.to_json())
         json_user = {
-            'url': url_for('api.get_user', id=self.id),
+            # 后端接口
+            # 'url': url_for('api.get_user', id=self.id),
             'id': self.id,
             'username': self.username,
             'nickname': self.nickname,
@@ -360,10 +361,9 @@ class User(db.Model):
             # 获赞数量(文章+评论获赞)
             'praised_count': total_praises,
             # 是否被当前用户关注
-            'is_followed_by_current_user': self.is_followed_by(current_user) if current_user else self.is_followed_by(
-                user),
+            'is_followed_by_current_user': self.is_followed_by(current_user) if current_user else False,
             # 是否关注了当前用户
-            'is_following_current_user': self.is_following(current_user) if current_user else self.is_following(user),
+            'is_following_current_user': self.is_following(current_user) if current_user else False,
             'interest': interest,
             'social_account': self.social_account,
             'tags': [tag.name for tag in self.tags]
@@ -696,6 +696,16 @@ class Tag(db.Model):
             'id': self.id,
             'name': self.name
         }
+
+
+# 为Tag模型添加删除前的事件监听。注意，批量删除不会触发，需要改为逐个删除
+@event.listens_for(Tag, 'before_delete')
+def delete_tag_cleanup(mapper, connection, target):
+    """删除Tag前，清理中间表中所有关联记录"""
+    # 删除中间表中该tag_id对应的所有记录
+    connection.execute(
+        user_tag.delete().where(user_tag.c.tag_id == target.id)
+    )
 
 
 user_tag = db.Table('user_tag',
