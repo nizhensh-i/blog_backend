@@ -47,4 +47,3 @@ venv
 .env-redis
 
 *.tar
-test*
